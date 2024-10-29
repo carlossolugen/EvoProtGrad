@@ -7,6 +7,34 @@ import evo_prot_grad.common.tokenizers as tokenizers
 import pandas as pd
 import gc
 
+def convert_full_to_relative_sequences(full_sequences, ref_seq):
+    """
+    Convert a list of full sequences into relative sequence format based on a reference sequence.
+
+    Parameters:
+        full_sequences (list): List of full sequences (strings) to be converted.
+        ref_seq (str): Reference sequence (string) to compare against.
+
+    Returns:
+        list: List of relative sequences in the format 'A1B-A3C' where A is the reference amino acid,
+              1 is the site index (1-based), and B is the mutant amino acid.
+    """
+    relative_sequences = []
+
+    for seq in full_sequences:
+        mutations = []
+        for i, (ref_aa, mut_aa) in enumerate(zip(ref_seq, seq)):
+            #print((ref_aa, mut_aa))
+            if ref_aa != mut_aa:
+                mutation = f"{ref_aa}{i+1}{mut_aa}"
+                mutations.append(mutation)
+        relative_sequences.append('-'.join(mutations))
+
+    return relative_sequences
+
+def prep_seqs(seqs, ref_seq):
+    return [convert_full_to_relative_sequences([seq.replace(" ", "")], ref_seq.replace(" ", "")) for seq in seqs]
+    
 class DirectedEvolution:
     """Main class for plug and play directed evolution with gradient-based discrete MCMC.
     """
@@ -134,7 +162,8 @@ class DirectedEvolution:
             oh, score = expert(inputs)
             ohs += [oh]
             scores += [expert.temperature * score]
-        # sum scores over experts
+            inputs2 = [seq.replace(" ", "") for seq in inputs]
+            scores2 = [score.detach().cpu().numpy() for score in scores]
         return ohs, torch.stack(scores, dim=0).sum(dim=0)
     
 
@@ -184,6 +213,8 @@ class DirectedEvolution:
         sequence_scores = {}
 
         # Iterate through the flattened list to count sequences and record first appearance
+        if len(scores.shape) == 1:  # If scores has a single dimension
+            scores = scores.reshape(-1, 1)  # Reshape to have two dimensions
         for i, sublist in enumerate(variants):
             for j, seq in enumerate(sublist):
                 flat_seq = ''.join(seq.split())
@@ -242,6 +273,11 @@ class DirectedEvolution:
             for key, value in params.items():
                 f.write(f'{key}: {value}\n')
 
+    def _recompute_score(self, seq):
+        ohs, score = self.experts[0]([seq])
+        return score.detach().flatten().cpu().numpy()
+
+        
     def __call__(self) -> Tuple[List[str], np.ndarray]:
         """
         Run the gradient-based MCMC sampler.
@@ -261,6 +297,9 @@ class DirectedEvolution:
         pos_mask = pos_mask.reshape(self.parallel_chains,-1)
 
         for i in range(self.n_steps):
+            print(f"#### Starting iteration {i}.")
+            start_seqs = self.chains.copy()
+            self.chains = self.canonical_chain_tokenizer.decode(cur_chains_oh) # to reflect any reset chains that reached multiple mutations
             ###### sample path length
             U = torch.randint(1, 2 * self.max_pas_path_length, size=(self.parallel_chains,1))
             max_u = int(torch.max(U).item())
@@ -274,7 +313,6 @@ class DirectedEvolution:
             # Need to use the string version of the chain to pass to experts
             ohs, PoE = self._product_of_experts(self.chains)
             grad_x = self._compute_gradients(ohs, PoE)
-
             # do U intermediate steps
             with torch.no_grad():
                 for step in range(max_u):
@@ -311,12 +349,12 @@ class DirectedEvolution:
                     row_select = changes_all.sum(-1).unsqueeze(-1)  # [n_chains,seq_len,1]
                     new_x = cur_chains_oh * (1.0 - row_select) + changes_all
                     cur_u_mask = u_mask[:, step].unsqueeze(-1).unsqueeze(-1)
-                    cur_chains_oh = cur_u_mask * new_x + (1 - cur_u_mask) * cur_chains_oh
+                    cur_chains_oh2 = cur_u_mask * new_x + (1 - cur_u_mask) * cur_chains_oh
                     
-                y = cur_chains_oh
+                y = cur_chains_oh2.clone()
             
             # last step
-            y_strs = self.canonical_chain_tokenizer.decode(y)
+            y_strs = self.canonical_chain_tokenizer.decode(y) # Created string version of potentially new seqs. Compare them to old seqs
             ohs, proposed_PoE = self._product_of_experts(y_strs)
             grad_y = self._compute_gradients(ohs, proposed_PoE)
             grad_y = grad_y.detach()
@@ -336,20 +374,32 @@ class DirectedEvolution:
                 #log_acc = log_backwd - log_fwd
                 m_term = (proposed_PoE.squeeze() - PoE.squeeze())
                 log_acc = m_term + log_ratio
-                #print(f"log_acc has shape {log_acc}, m_term has shape {m_term.shape}, and log_ratio has shape {log_ratio.shape}.")
                 accepted = (log_acc.exp() >= torch.rand_like(log_acc)).float().view(-1, *([1] * x_rank)) # original
-                #accepted = (log_acc.exp() >= torch.rand_like(log_acc)).float().view(-1, 1, 1)
-                #print(f"y has shape {y.shape}, and accepted has shape {accepted.shape}")
-                cur_chains_oh = y * accepted + (1.0 - accepted) * cur_chains_oh
-
+                # handle with a for loop
+                accepted, PoE = accepted.squeeze(), PoE.squeeze().clone()
+                
+                dec_seqs = self.canonical_chain_tokenizer.decode(cur_chains_oh2)
+                for i in range(len(accepted)):
+                    if accepted[i] == 1:
+                        cur_chains_oh[i, :, :] = y[i, :, :]
+                        PoE[i] = proposed_PoE[i]
+                        self.chains[i] = self.canonical_chain_tokenizer.decode(cur_chains_oh[i, :, :].unsqueeze(0))[0]
+                #cur_chains_oh2 = y * accepted + (1.0 - accepted) * cur_chains_oh
+                #for chain_idx in range(self.parallel_chains):
+                #    if accepted.squeeze()[chain_idx] == 0:
+                #        # Compare cur_chains_oh and cur_chains_oh2 for chains where accepted is 0
+                #        if not torch.equal(cur_chains_oh[chain_idx], cur_chains_oh2[chain_idx]):
+                #cur_chains_oh = cur_chains_oh2
+              
             # Current chain state book-keeping    
-            self.chains_oh = cur_chains_oh
-            self.chains = self.canonical_chain_tokenizer.decode(cur_chains_oh)
+            self.chains_oh = cur_chains_oh.clone()
+            # Check that cur_chains_oh and self.chains are synchronized
+            decoded_sequences = self.canonical_chain_tokenizer.decode(self.chains_oh)
+            dec_seqs = self.canonical_chain_tokenizer.decode(self.chains_oh)
             # History book-keeping
             self.chains_oh_history += [cur_chains_oh.clone()]
-            PoE = proposed_PoE.squeeze() * accepted.squeeze() + PoE.squeeze() * (1. - accepted.squeeze())
             self.PoE_history += [PoE.clone()]
-
+            
             if self.verbose:
                 x_strs = self.canonical_chain_tokenizer.decode(cur_chains_oh)
                 for idx in range(log_acc.size(0)):
@@ -364,7 +414,7 @@ class DirectedEvolution:
                 mask_flag = (dist >= self.max_mutations).bool()
                 mask_flag = mask_flag.reshape(self.parallel_chains)
                 cur_chains_oh[mask_flag] = self.wt_oh
-
+                      
             if i > 10 and i % 100 == 0:
                 print(f"Finished step {i} out of {self.n_steps}.")
                 if torch.cuda.is_available():
@@ -376,8 +426,11 @@ class DirectedEvolution:
             scores_ = self.PoE_history[-1].detach().cpu().numpy()
         elif self.output == 'all':
             output_ = []
-            for i in range(len(self.chains_oh_history)):
-                output_ += [ self.canonical_chain_tokenizer.decode(self.chains_oh_history[i]) ]
+            for j in range(len(self.chains_oh_history)):
+                decoded_sequences = self.canonical_chain_tokenizer.decode(self.chains_oh_history[j])
+                scores = self.PoE_history[j].detach().cpu().numpy()  # Convert PoE to numpy for easier handling
+                seqs = prep_seqs(decoded_sequences, self.wtseq)   
+                output_ += [ decoded_sequences ]
             scores_ = torch.stack(self.PoE_history).detach().cpu().numpy()
         elif self.output == 'best':
             best_idxs = torch.stack(self.PoE_history).argmax(0)
